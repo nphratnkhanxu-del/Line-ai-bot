@@ -16,7 +16,7 @@ const lineMiddleware = line.middleware(lineConfig);
 // ---------- ตั้งค่า Gemini AI (ฟรี) ----------
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 const model = genAI.getGenerativeModel({
-  model: 'gemini-2.5-flash-lite', // อยู่ในฟรีเทียร์ของ Google
+  model: 'gemini-2.5-flash', // อัปเดตเป็นโมเดลเวอร์ชันปัจจุบันที่รองรับฟรีเทียร์แล้ว
   systemInstruction:
     'คุณเป็นผู้ช่วย AI ที่ตอบคำถามผ่านแชท LINE ตอบให้กระชับ เป็นกันเอง เข้าใจง่าย และตอบเป็นภาษาไทยเป็นหลัก เว้นแต่ผู้ใช้ถามเป็นภาษาอื่น',
 });
