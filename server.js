@@ -3,90 +3,185 @@ const express = require('express');
 const line = require('@line/bot-sdk');
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 
-// ---------- ตั้งค่า LINE ----------
+// ==========================
+// LINE CONFIG
+// ==========================
 const lineConfig = {
   channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN,
   channelSecret: process.env.LINE_CHANNEL_SECRET,
 };
-const lineClient = new line.messagingApi.MessagingApiClient({
+
+const client = new line.messagingApi.MessagingApiClient({
   channelAccessToken: lineConfig.channelAccessToken,
 });
-const lineMiddleware = line.middleware(lineConfig);
 
-// ---------- ตั้งค่า Gemini AI (ฟรี) ----------
+const middleware = line.middleware(lineConfig);
+
+// ==========================
+// GEMINI CONFIG
+// ==========================
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+
 const model = genAI.getGenerativeModel({
-  model: 'gemini-2.0-flash', // เปลี่ยนเป็น 2.0-flash โมเดลมาตรฐานยุคปัจจุบันที่ระบบต้องการ
+  model: "gemini-2.0-flash",
   systemInstruction:
-    'คุณเป็นผู้ช่วย AI ที่ตอบคำถามผ่านแชท LINE ตอบให้กระชับ เป็นกันเอง เข้าใจง่าย และตอบเป็นภาษาไทยเป็นหลัก เว้นแต่ผู้ใช้ถามเป็นภาษาอื่น',
+    "คุณเป็นผู้ช่วย AI ภาษาไทย ตอบสั้น กระชับ สุภาพ เข้าใจง่าย ถ้าผู้ใช้ถามภาษาอื่นให้ตอบภาษานั้น",
 });
 
-// เก็บประวัติแชทของแต่ละคนไว้ในหน่วยความจำ (ง่าย ๆ ไม่ต้องใช้ฐานข้อมูล)
-// หมายเหตุ: ถ้าเซิร์ฟเวอร์รีสตาร์ท ประวัติจะหายไป (เหมาะกับ demo/เริ่มต้น)
-const chatHistory = new Map(); // key: userId, value: array of {role, parts}
-const MAX_HISTORY_MESSAGES = 10; // เก็บย้อนหลังกี่ข้อความ กันบริบทยาวเกินไป
+// ==========================
+// CHAT MEMORY
+// ==========================
+const chatHistory = new Map();
 
-async function askGemini(userId, userMessage) {
-  // ดึงประวัติเก่ามา ถ้าไม่มีให้สร้างอาร์เรย์ว่าง
-  const history = chatHistory.get(userId) || [];
+const MAX_HISTORY_MESSAGES = 4;
+const MAX_INPUT_LENGTH = 1000;
 
-  // เริ่มเซสชันแชทด้วยประวัติเก่า
-  const chat = model.startChat({ history });
-  
-  // ส่งข้อความปัจจุบัน
-  const result = await chat.sendMessage(userMessage);
-  const replyText = result.response.text();
+// ==========================
 
-  // ดึงประวัติล่าสุดที่รวมข้อความใหม่แล้วจากตัวแปร chat โดยตรง
-  const updatedHistory = await chat.getHistory();
-  
-  // ตัดประวัติให้ไม่ยาวเกินไป และบันทึกลง Map
-  chatHistory.set(userId, updatedHistory.slice(-MAX_HISTORY_MESSAGES));
-
-  return replyText || 'ขอโทษครับ ตอบไม่ได้ในตอนนี้ ลองถามใหม่อีกครั้งนะครับ';
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+// ==========================
+
+async function askGemini(userId, message) {
+
+  const history = chatHistory.get(userId) || [];
+
+  const chat = model.startChat({
+    history
+  });
+
+  let result;
+
+  try {
+
+    result = await chat.sendMessage(message);
+
+  } catch (err) {
+
+    // Retry เมื่อเจอ 429
+    if (err.status === 429) {
+
+      console.log("Quota exceeded, retry after 35 sec...");
+
+      await sleep(35000);
+
+      result = await chat.sendMessage(message);
+
+    } else {
+
+      throw err;
+
+    }
+
+  }
+
+  const text = result.response.text();
+
+  const updatedHistory = await chat.getHistory();
+
+  chatHistory.set(
+    userId,
+    updatedHistory.slice(-MAX_HISTORY_MESSAGES)
+  );
+
+  return text || "ขออภัย ไม่สามารถตอบได้";
+}
+
+// ==========================
+
 async function handleEvent(event) {
-  // รับเฉพาะข้อความตัวอักษรที่ผู้ใช้พิมพ์มา
-  if (event.type !== 'message' || event.message.type !== 'text') {
+
+  if (
+    event.type !== "message" ||
+    event.message.type !== "text"
+  ) {
     return null;
   }
 
-  const userId = event.source.userId || 'unknown';
-  const userMessage = event.message.text;
+  const userId = event.source.userId || "unknown";
+
+  const userMessage =
+    event.message.text.substring(0, MAX_INPUT_LENGTH);
 
   let replyText;
+
   try {
+
     replyText = await askGemini(userId, userMessage);
+
   } catch (err) {
-    console.error('AI error:', err);
-    replyText = 'ขอโทษครับ ระบบ AI มีปัญหาชั่วคราว ลองใหม่อีกครั้งนะครับ';
+
+    console.error(err);
+
+    if (err.status === 429) {
+
+      replyText =
+        "ตอนนี้ AI มีผู้ใช้งานจำนวนมาก กรุณารอสักครู่แล้วลองใหม่อีกครั้ง 🙏";
+
+    } else {
+
+      replyText =
+        "ขออภัย ระบบ AI ขัดข้องชั่วคราว";
+
+    }
+
   }
 
-  return lineClient.replyMessage({
+  return client.replyMessage({
+
     replyToken: event.replyToken,
-    messages: [{ type: 'text', text: replyText }],
+
+    messages: [
+      {
+        type: "text",
+        text: replyText
+      }
+    ]
+
   });
+
 }
+
+// ==========================
 
 const app = express();
 
-app.get('/', (req, res) => {
-  res.send('LINE AI bot is running.');
+app.get("/", (req, res) => {
+
+  res.send("LINE AI BOT RUNNING");
+
 });
 
-app.post('/webhook', lineMiddleware, async (req, res) => {
-  try {
-    const events = req.body.events || [];
-    await Promise.all(events.map(handleEvent));
-    res.status(200).end();
-  } catch (err) {
-    console.error('Webhook error:', err);
-    res.status(500).end();
+app.post(
+  "/webhook",
+  middleware,
+  async (req, res) => {
+
+    try {
+
+      await Promise.all(
+        req.body.events.map(handleEvent)
+      );
+
+      res.status(200).end();
+
+    } catch (err) {
+
+      console.error(err);
+
+      res.status(500).end();
+
+    }
+
   }
-});
+);
 
-const port = process.env.PORT || 3000;
-app.listen(port, () => {
-  console.log(`Server listening on port ${port}`);
+const PORT = process.env.PORT || 3000;
+
+app.listen(PORT, () => {
+
+  console.log("Server Started :", PORT);
+
 });
