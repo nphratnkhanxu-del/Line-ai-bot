@@ -16,7 +16,7 @@ const lineMiddleware = line.middleware(lineConfig);
 // ---------- ตั้งค่า Gemini AI (ฟรี) ----------
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 const model = genAI.getGenerativeModel({
-  model: 'gemini-3.1-flash-lite', // รุ่นล่าสุดในฟรีเทียร์ (รุ่น 2.5 ถูกปิดสำหรับบัญชีใหม่แล้ว)
+  model: 'gemini-2.5-flash-lite', // อยู่ในฟรีเทียร์ของ Google
   systemInstruction:
     'คุณเป็นผู้ช่วย AI ที่ตอบคำถามผ่านแชท LINE ตอบให้กระชับ เป็นกันเอง เข้าใจง่าย และตอบเป็นภาษาไทยเป็นหลัก เว้นแต่ผู้ใช้ถามเป็นภาษาอื่น',
 });
@@ -27,18 +27,20 @@ const chatHistory = new Map(); // key: userId, value: array of {role, parts}
 const MAX_HISTORY_MESSAGES = 10; // เก็บย้อนหลังกี่ข้อความ กันบริบทยาวเกินไป
 
 async function askGemini(userId, userMessage) {
+  // ดึงประวัติเก่ามา ถ้าไม่มีให้สร้างอาร์เรย์ว่าง
   const history = chatHistory.get(userId) || [];
 
+  // เริ่มเซสชันแชทด้วยประวัติเก่า
   const chat = model.startChat({ history });
+  
+  // ส่งข้อความปัจจุบัน
   const result = await chat.sendMessage(userMessage);
   const replyText = result.response.text();
 
-  const updatedHistory = [
-    ...history,
-    { role: 'user', parts: [{ text: userMessage }] },
-    { role: 'model', parts: [{ text: replyText }] },
-  ];
-  // ตัดประวัติให้ไม่ยาวเกินไป
+  // ดึงประวัติล่าสุดที่รวมข้อความใหม่แล้วจากตัวแปร chat โดยตรง (ป้องกันปัญหาเรื่องโครงสร้างข้อมูลเพี้ยน)
+  const updatedHistory = await chat.getHistory();
+  
+  // ตัดประวัติให้ไม่ยาวเกินไป และบันทึกลง Map
   chatHistory.set(userId, updatedHistory.slice(-MAX_HISTORY_MESSAGES));
 
   return replyText || 'ขอโทษครับ ตอบไม่ได้ในตอนนี้ ลองถามใหม่อีกครั้งนะครับ';
