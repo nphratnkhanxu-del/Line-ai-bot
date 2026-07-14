@@ -37,151 +37,149 @@ const MAX_HISTORY_MESSAGES = 4;
 const MAX_INPUT_LENGTH = 1000;
 
 // ==========================
-
+// Helper: sleep
+// ==========================
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
 // ==========================
+// Helper: extract retryDelay (seconds) from Gemini 429 error
+// ==========================
+function getRetryDelaySeconds(err, fallback = 30) {
+  try {
+    const details = err.errorDetails || [];
+    const retryInfo = details.find(
+      (d) => d['@type'] === 'type.googleapis.com/google.rpc.RetryInfo'
+    );
+    if (retryInfo && retryInfo.retryDelay) {
+      // retryDelay looks like "58s"
+      const seconds = parseFloat(retryInfo.retryDelay.replace('s', ''));
+      if (!isNaN(seconds)) return Math.ceil(seconds);
+    }
+  } catch (e) {
+    // ignore parsing errors, use fallback
+  }
+  return fallback;
+}
 
-async function askGemini(userId, message) {
-
+// ==========================
+// Core Gemini call (NO blocking sleep here anymore)
+// ==========================
+async function askGeminiOnce(userId, message) {
   const history = chatHistory.get(userId) || [];
 
-  const chat = model.startChat({
-    history
-  });
+  const chat = model.startChat({ history });
 
-  let result;
-
-  try {
-
-    result = await chat.sendMessage(message);
-
-  } catch (err) {
-
-    // Retry เมื่อเจอ 429
-    if (err.status === 429) {
-
-      console.log("Quota exceeded, retry after 35 sec...");
-
-      await sleep(35000);
-
-      result = await chat.sendMessage(message);
-
-    } else {
-
-      throw err;
-
-    }
-
-  }
-
+  const result = await chat.sendMessage(message);
   const text = result.response.text();
 
   const updatedHistory = await chat.getHistory();
-
-  chatHistory.set(
-    userId,
-    updatedHistory.slice(-MAX_HISTORY_MESSAGES)
-  );
+  chatHistory.set(userId, updatedHistory.slice(-MAX_HISTORY_MESSAGES));
 
   return text || "ขออภัย ไม่สามารถตอบได้";
 }
 
 // ==========================
+// Background retry + push message
+// Used when the first attempt fails with 429
+// ==========================
+async function retryInBackgroundAndPush(userId, message) {
+  try {
+    // small buffer added on top of Google's suggested retryDelay
+    await sleep(5000);
 
+    const text = await askGeminiOnce(userId, message);
+
+    await client.pushMessage({
+      to: userId,
+      messages: [{ type: "text", text }],
+    });
+  } catch (err) {
+    console.error("Background retry failed:", err);
+
+    // Only push a failure message if it's still failing after retry
+    try {
+      await client.pushMessage({
+        to: userId,
+        messages: [{
+          type: "text",
+          text: "ขออภัย ระบบ AI ยังไม่พร้อมใช้งานในตอนนี้ กรุณาลองใหม่อีกครั้งภายหลัง 🙏",
+        }],
+      });
+    } catch (pushErr) {
+      console.error("Push message also failed:", pushErr);
+    }
+  }
+}
+
+// ==========================
+// Main event handler
+// ==========================
 async function handleEvent(event) {
-
-  if (
-    event.type !== "message" ||
-    event.message.type !== "text"
-  ) {
+  if (event.type !== "message" || event.message.type !== "text") {
     return null;
   }
 
   const userId = event.source.userId || "unknown";
-
-  const userMessage =
-    event.message.text.substring(0, MAX_INPUT_LENGTH);
+  const userMessage = event.message.text.substring(0, MAX_INPUT_LENGTH);
 
   let replyText;
+  let needsBackgroundRetry = false;
+  let retryDelaySeconds = 30;
 
   try {
-
-    replyText = await askGemini(userId, userMessage);
-
+    replyText = await askGeminiOnce(userId, userMessage);
   } catch (err) {
-
     console.error(err);
 
     if (err.status === 429) {
-
+      retryDelaySeconds = getRetryDelaySeconds(err, 30);
       replyText =
         "ตอนนี้ AI มีผู้ใช้งานจำนวนมาก กรุณารอสักครู่แล้วลองใหม่อีกครั้ง 🙏";
-
+      needsBackgroundRetry = true;
     } else {
-
-      replyText =
-        "ขออภัย ระบบ AI ขัดข้องชั่วคราว";
-
+      replyText = "ขออภัย ระบบ AI ขัดข้องชั่วคราว";
     }
-
   }
 
-  return client.replyMessage({
-
+  // Reply immediately so the replyToken doesn't expire (~1 min limit)
+  await client.replyMessage({
     replyToken: event.replyToken,
-
-    messages: [
-      {
-        type: "text",
-        text: replyText
-      }
-    ]
-
+    messages: [{ type: "text", text: replyText }],
   });
 
+  // If quota-limited, try again in the background and push the real answer later
+  if (needsBackgroundRetry) {
+    // fire-and-forget, do not await here (don't block the webhook response)
+    retryInBackgroundAndPush(userId, userMessage);
+  }
+
+  return null;
 }
 
 // ==========================
-
+// Express app
+// ==========================
 const app = express();
 
 app.get("/", (req, res) => {
-
   res.send("LINE AI BOT RUNNING");
-
 });
 
-app.post(
-  "/webhook",
-  middleware,
-  async (req, res) => {
+app.post("/webhook", middleware, async (req, res) => {
+  try {
+    // Respond to LINE fast; process events without blocking the HTTP response
+    res.status(200).end();
 
-    try {
-
-      await Promise.all(
-        req.body.events.map(handleEvent)
-      );
-
-      res.status(200).end();
-
-    } catch (err) {
-
-      console.error(err);
-
-      res.status(500).end();
-
-    }
-
+    await Promise.all(req.body.events.map(handleEvent));
+  } catch (err) {
+    console.error(err);
   }
-);
+});
 
 const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, () => {
-
   console.log("Server Started :", PORT);
-
 });
